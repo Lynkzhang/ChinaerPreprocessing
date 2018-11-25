@@ -16,13 +16,6 @@ from chainer.training import extensions
 
 import chainermn
 
-
-#import models.alex as alex
-#import models.googlenet as googlenet
-#import models.googlenetbn as googlenetbn
-#import models.nin as nin
-#import models.resnet50 as resnet50
-import resnet200_v1 as resnet200
 # Check Python version if it supports multiprocessing.set_start_method,
 # which was introduced in Python 3.4
 major, minor, _, _, _ = sys.version_info
@@ -35,8 +28,10 @@ if major <= 2 or (major == 3 and minor < 4):
                      "tutorial/tips_faqs.html#using-multiprocessiterator\n")
     exit(-1)
 
+#imagenet
 rgbmean=np.array([123.68, 116.779, 103.939])
 targetsize = 256.0
+
 class PreprocessedDataset(chainer.dataset.DatasetMixin):
 
     def __init__(self, path, root, mean, crop_size, random=True):
@@ -101,166 +96,3 @@ class PreprocessedDataset(chainer.dataset.DatasetMixin):
         #print(image.dtype,image.shape)
         #print(type(image.array))
         return image.array, label
-
-
-# chainermn.create_multi_node_evaluator can be also used with user customized
-# evaluator classes that inherit chainer.training.extensions.Evaluator.
-class TestModeEvaluator(extensions.Evaluator):
-
-    def evaluate(self):
-        model = self.get_target('main')
-        model.train = False
-        ret = super(TestModeEvaluator, self).evaluate()
-        model.train = True
-        return ret
-
-def lr_drop(trainer):
-    trainer.updater.get_optimizer('main').lr *= 0.1
-
-def main():
-    # Check if GPU is available
-    # (ImageNet example does not support CPU execution)
-    if not chainer.cuda.available:
-        raise RuntimeError("ImageNet requires GPU support.")
-
-    archs = {
-        #'alex': alex.Alex,
-        #'googlenet': googlenet.GoogLeNet,
-        #'googlenetbn': googlenetbn.GoogLeNetBN,
-        #'nin': nin.NIN,
-        #'resnet50': resnet50.ResNet50,
-        'resnet200':resnet200.ResNet200v1
-    }
-
-    parser = argparse.ArgumentParser(
-        description='Learning convnet from ILSVRC2012 dataset')
-    parser.add_argument('train', help='Path to training image-label list file')
-    parser.add_argument('val', help='Path to validation image-label list file')
-    parser.add_argument('--arch', '-a', choices=archs.keys(), default='nin',
-                        help='Convnet architecture')
-    parser.add_argument('--batchsize', '-B', type=int, default=32,
-                        help='Learning minibatch size')
-    parser.add_argument('--epoch', '-E', type=int, default=10,
-                        help='Number of epochs to train')
-    parser.add_argument('--initmodel',
-                        help='Initialize the model from given file')
-    parser.add_argument('--loaderjob', '-j', type=int,
-                        help='Number of parallel data loading processes')
-    parser.add_argument('--mean', '-m', default='mean.npy',
-                        help='Mean file (computed by compute_mean.py)')
-    parser.add_argument('--resume', '-r', default='',
-                        help='Initialize the trainer from given file')
-    parser.add_argument('--out', '-o', default='result',
-                        help='Output directory')
-    parser.add_argument('--root', '-R', default='.',
-                        help='Root directory path of image files')
-    parser.add_argument('--val_batchsize', '-b', type=int, default=250,
-                        help='Validation minibatch size')
-    parser.add_argument('--test', action='store_true')
-    parser.add_argument('--communicator', default='hierarchical')
-    parser.set_defaults(test=False)
-    args = parser.parse_args()
-
-    # Prepare ChainerMN communicator.
-    comm = chainermn.create_communicator(args.communicator)
-    device = comm.intra_rank
-
-    if comm.rank == 0:
-        print('==========================================')
-        print('Num process (COMM_WORLD): {}'.format(comm.size))
-        print('Using {} communicator'.format(args.communicator))
-        print('Using {} arch'.format(args.arch))
-        print('Num Minibatch-size: {}'.format(args.batchsize))
-        print('Num epoch: {}'.format(args.epoch))
-        print('==========================================')
-
-    model = archs[args.arch](1000)
-    if args.initmodel:
-        print('Load model from', args.initmodel)
-        chainer.serializers.load_npz(args.initmodel, model)
-
-    chainer.cuda.get_device_from_id(device).use()  # Make the GPU current
-    model.to_gpu()
-
-    # Split and distribute the dataset. Only worker 0 loads the whole dataset.
-    # Datasets of worker 0 are evenly split and distributed to all workers.
-    mean = np.load(args.mean)
-    if comm.rank == 0:
-        train = PreprocessedDataset(args.train, args.root, mean, model.insize)
-        val = PreprocessedDataset(
-            args.val, args.root, mean, model.insize, False)
-    else:
-        train = None
-        val = None
-    train = chainermn.scatter_dataset(train, comm, shuffle=True)
-    val = chainermn.scatter_dataset(val, comm)
-
-    # We need to change the start method of multiprocessing module if we are
-    # using InfiniBand and MultiprocessIterator. This is because processes
-    # often crash when calling fork if they are using Infiniband.
-    # (c.f., https://www.open-mpi.org/faq/?category=tuning#fork-warning )
-    multiprocessing.set_start_method('forkserver')
-    train_iter = chainer.iterators.MultiprocessIterator(
-        train, args.batchsize, n_processes=args.loaderjob)
-    val_iter = chainer.iterators.MultiprocessIterator(
-        val, args.val_batchsize, repeat=False, n_processes=args.loaderjob)
-
-    # Create a multi node optimizer from a standard Chainer optimizer.
-    optimizer = chainermn.create_multi_node_optimizer(
-        chainer.optimizers.MomentumSGD(lr=0.1, momentum=0.9), comm)
-        #chainer.optimizers.Adam(), comm)
-    #optimizer.add_hook(chainer.optimizer_hooks.WeightDecay(0.0001))
-    optimizer.setup(model)
-    optimizer.add_hook(chainer.optimizer_hooks.WeightDecay(0.0001))
-
-
-    # Set up a trainer
-    updater = training.StandardUpdater(train_iter, optimizer, device=device)
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), args.out)
-
-    checkpoint_interval = (10, 'iteration') if args.test else (1, 'epoch')
-    val_interval = (10, 'iteration') if args.test else (1, 'epoch')
-    log_interval = (10, 'iteration') if args.test else (1, 'epoch')
-
-    checkpointer = chainermn.create_multi_node_checkpointer(
-        name='imagenet-example', comm=comm)
-    checkpointer.maybe_load(trainer, optimizer)
-    trainer.extend(checkpointer, trigger=checkpoint_interval)
-
-    # Create a multi node evaluator from an evaluator.
-    evaluator = TestModeEvaluator(val_iter, model, device=device)
-    evaluator = chainermn.create_multi_node_evaluator(evaluator, comm)
-    trainer.extend(evaluator, trigger=val_interval)
-
-    # Some display and output extensions are necessary only for one worker.
-    # (Otherwise, there would just be repeated outputs.)
-    statistics = {
-        #'test':lambda x: print("here")
-        'mean': lambda x: backend.get_array_module(x).mean(x),
-        'std': lambda x: backend.get_array_module(x).std(x),
-        'min': lambda x: backend.get_array_module(x).min(x),
-        'max': lambda x: backend.get_array_module(x).max(x),
-        'zeros': lambda x: backend.get_array_module(x).count_nonzero(x == 0),
-        'percentile': lambda x: backend.get_array_module(x).percentile(
-            x,(0, 0.25, 0.5, 0.75, 1.00))
-    }
-    if comm.rank == 0:
-        trainer.extend(lr_drop, trigger=(30, 'epoch'))
-        trainer.extend(extensions.ParameterStatistics(model,statistics),trigger=(1, 'epoch'))
-        trainer.extend(extensions.dump_graph('main/loss'))
-        trainer.extend(extensions.LogReport(trigger=log_interval))
-        trainer.extend(extensions.observe_lr(), trigger=log_interval)
-        trainer.extend(extensions.PrintReport([
-            'epoch', 'iteration', 'main/loss', 'validation/main/loss',
-            'main/accuracy', 'validation/main/accuracy', 'lr'
-        ]), trigger=log_interval)
-        trainer.extend(extensions.ProgressBar(update_interval=10))
-
-    if args.resume:
-        chainer.serializers.load_npz(args.resume, trainer)
-
-    trainer.run()
-
-
-if __name__ == '__main__':
-    main()
